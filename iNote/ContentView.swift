@@ -11,6 +11,31 @@ import Vision
 import UIKit
 import Combine
 
+enum DrawingTool: Equatable {
+    case pen(color: UIColor, width: CGFloat)
+    case eraser
+
+    var pkTool: PKTool {
+        switch self {
+        case .pen(let color, let width):
+            return PKInkingTool(.pen, color: color, width: width)
+        case .eraser:
+            return PKEraserTool(.vector)
+        }
+    }
+
+    static func == (lhs: DrawingTool, rhs: DrawingTool) -> Bool {
+        switch (lhs, rhs) {
+        case let (.pen(color1, width1), .pen(color2, width2)):
+            return color1 == color2 && width1 == width2
+        case (.eraser, .eraser):
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 class CanvasManager: ObservableObject {
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
@@ -45,6 +70,7 @@ struct ContentView: View {
     @State private var editingTitle = ""
     @State private var showingNoteList = false
     @State private var selectedNoteIndex = 0
+    @State private var selectedTool: DrawingTool = .pen(color: .black, width: 2)
     
     // 現在のノートブックのメモを取得
     private var noteManager: NoteManager {
@@ -148,6 +174,8 @@ struct ContentView: View {
                         }
                         .foregroundColor(.black)
                         
+                        ToolPickerView(selectedTool: $selectedTool)
+                        
                         Spacer()
                         
                         HStack(spacing: 12) {
@@ -219,6 +247,7 @@ struct ContentView: View {
                             notes: noteManager.notes,
                             currentIndex: $selectedNoteIndex,
                             canvasManager: canvasManager,
+                            selectedTool: $selectedTool,
                             onNoteChanged: {
                                 noteManager.saveNotes()
                             },
@@ -332,6 +361,45 @@ struct ContentView: View {
                     showingTitleEditor = false
                 }
             )
+        }
+    }
+}
+
+// ツールピッカービュー
+struct ToolPickerView: View {
+    @Binding var selectedTool: DrawingTool
+
+    var body: some View {
+        HStack(spacing: 20) {
+            ToolButton(tool: .pen(color: .black, width: 2), selectedTool: $selectedTool, systemName: "pencil.tip", color: .black)
+            ToolButton(tool: .pen(color: .red, width: 2), selectedTool: $selectedTool, systemName: "pencil.tip", color: .red)
+            ToolButton(tool: .pen(color: .blue, width: 2), selectedTool: $selectedTool, systemName: "pencil.tip", color: .blue)
+            ToolButton(tool: .eraser, selectedTool: $selectedTool, systemName: "eraser.fill", color: .black)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color(.systemGray5))
+        .cornerRadius(20)
+    }
+}
+
+// ツールボタン
+struct ToolButton: View {
+    let tool: DrawingTool
+    @Binding var selectedTool: DrawingTool
+    let systemName: String
+    let color: Color
+
+    var body: some View {
+        Button(action: {
+            selectedTool = tool
+        }) {
+            Image(systemName: systemName)
+                .font(.title2)
+                .foregroundColor(selectedTool == tool ? .white : color)
+                .padding(8)
+                .background(selectedTool == tool ? Color.blue : Color.clear)
+                .clipShape(Circle())
         }
     }
 }
@@ -548,12 +616,14 @@ struct NoteListItemView: View {
 struct NoteCanvasView: View {
     @Binding var note: Note
     let canvasManager: CanvasManager
+    @Binding var selectedTool: DrawingTool
     let onNoteChanged: () -> Void
     
     var body: some View {
         PKCanvasViewRepresentable(
             note: $note,
             canvasManager: canvasManager,
+            selectedTool: $selectedTool,
             onDrawingChanged: { recognizedText in
                 if !recognizedText.isEmpty && note.title == "新しいメモ" {
                     note.title = recognizedText
@@ -623,11 +693,13 @@ struct NoteCanvasView: View {
 struct PKCanvasViewRepresentable: UIViewRepresentable {
     @Binding var note: Note
     let canvasManager: CanvasManager
+    @Binding var selectedTool: DrawingTool
     let onDrawingChanged: (String) -> Void
     
     func makeUIView(context: Context) -> PKCanvasView {
         let canvasView = PKCanvasView()
         
+        canvasView.tool = selectedTool.pkTool
         canvasView.backgroundColor = .white
         canvasView.delegate = context.coordinator
         
@@ -656,6 +728,12 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: PKCanvasView, context: Context) {
+        // ヘッダーのツールピッカーで選択されたツールを反映
+        if selectedTool != context.coordinator.lastSelectedTool {
+            uiView.tool = selectedTool.pkTool
+            context.coordinator.lastSelectedTool = selectedTool
+        }
+
         // note ID が変更された場合、または描画データが異なる場合にキャンバスを更新
         if context.coordinator.lastNoteID != note.id {
             do {
@@ -677,10 +755,11 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
         Coordinator(self, canvasManager: canvasManager, onDrawingChanged: onDrawingChanged)
     }
     
-    class Coordinator: NSObject, PKCanvasViewDelegate {
+    class Coordinator: NSObject, PKCanvasViewDelegate, PKToolPickerObserver {
         let parent: PKCanvasViewRepresentable
         let canvasManager: CanvasManager
         var lastNoteID: UUID?
+        var lastSelectedTool: DrawingTool?
         private var isUpdating = false
         private let onDrawingChanged: (String) -> Void
         let toolPicker = PKToolPicker()
@@ -689,6 +768,7 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
             self.parent = parent
             self.canvasManager = canvasManager
             self.onDrawingChanged = onDrawingChanged
+            self.lastSelectedTool = parent.selectedTool
         }
         
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
@@ -763,6 +843,7 @@ struct PageFlipView: View {
     let notes: [Note]
     @Binding var currentIndex: Int
     let canvasManager: CanvasManager
+    @Binding var selectedTool: DrawingTool
     let onNoteChanged: () -> Void
     let onAddPage: () -> Void
     
@@ -846,6 +927,7 @@ struct PageFlipView: View {
                         NoteCanvasView(
                             note: .constant(notes[prevIndex]),
                             canvasManager: canvasManager,
+                            selectedTool: $selectedTool,
                             onNoteChanged: onNoteChanged
                         )
                         .id(notes[prevIndex].id) // IDを追加してビューを再生成
@@ -885,6 +967,7 @@ struct PageFlipView: View {
                             }
                         ),
                         canvasManager: canvasManager,
+                        selectedTool: $selectedTool,
                         onNoteChanged: onNoteChanged
                     )
                     .id(notes[safeCurrentIndex].id) // IDを追加してビューを再生成
@@ -906,6 +989,7 @@ struct PageFlipView: View {
                         NoteCanvasView(
                             note: .constant(notes[nextIndex]),
                             canvasManager: canvasManager,
+                            selectedTool: $selectedTool,
                             onNoteChanged: onNoteChanged
                         )
                         .id(notes[nextIndex].id) // IDを追加してビューを再生成
