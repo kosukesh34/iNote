@@ -11,8 +11,35 @@ import Vision
 import UIKit
 import Combine
 
+class CanvasManager: ObservableObject {
+    @Published private(set) var canUndo = false
+    @Published private(set) var canRedo = false
+
+    fileprivate weak var undoManager: UndoManager? {
+        didSet {
+            updateUndoRedoState()
+        }
+    }
+
+    func undo() {
+        undoManager?.undo()
+        updateUndoRedoState()
+    }
+
+    func redo() {
+        undoManager?.redo()
+        updateUndoRedoState()
+    }
+
+    func updateUndoRedoState() {
+        canUndo = undoManager?.canUndo ?? false
+        canRedo = undoManager?.canRedo ?? false
+    }
+}
+
 struct ContentView: View {
     @StateObject private var noteBookManager = NoteBookManager()
+    @StateObject private var canvasManager = CanvasManager()
     @State private var showingSideMenu = false
     @State private var showingTitleEditor = false
     @State private var editingTitle = ""
@@ -62,6 +89,9 @@ struct ContentView: View {
                             if self.selectedNoteIndex >= self.noteManager.notes.count {
                                 self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
                             }
+                        },
+                        onUpdateNote: { index, newTitle in
+                            noteManager.updateNoteTitle(at: index, newTitle: newTitle)
                         }
                     )
                     .frame(width: 300)
@@ -100,6 +130,23 @@ struct ContentView: View {
                             }
                             .buttonStyle(PlainButtonStyle())
                         }
+                        
+                        Spacer()
+                        
+                        HStack(spacing: 20) {
+                            Button(action: canvasManager.undo) {
+                                Image(systemName: "arrow.uturn.backward.circle")
+                                    .font(.title2)
+                            }
+                            .disabled(!canvasManager.canUndo)
+
+                            Button(action: canvasManager.redo) {
+                                Image(systemName: "arrow.uturn.forward.circle")
+                                    .font(.title2)
+                            }
+                            .disabled(!canvasManager.canRedo)
+                        }
+                        .foregroundColor(.black)
                         
                         Spacer()
                         
@@ -171,6 +218,7 @@ struct ContentView: View {
                         PageFlipView(
                             notes: noteManager.notes,
                             currentIndex: $selectedNoteIndex,
+                            canvasManager: canvasManager,
                             onNoteChanged: {
                                 noteManager.saveNotes()
                             },
@@ -277,8 +325,7 @@ struct ContentView: View {
                 title: $editingTitle,
                 onSave: { newTitle in
                     if !noteManager.notes.isEmpty && selectedNoteIndex >= 0 && selectedNoteIndex < noteManager.notes.count {
-                        noteManager.notes[selectedNoteIndex].title = newTitle
-                        noteManager.saveNotes()
+                        noteManager.updateNoteTitle(at: selectedNoteIndex, newTitle: newTitle)
                     }
                 },
                 onCancel: {
@@ -298,6 +345,7 @@ struct SideMenuView: View {
     let onAddPage: () -> Void
     let onMergePages: () -> Void
     let onDeleteNote: (Int) -> Void
+    let onUpdateNote: (Int, String) -> Void
     @State private var showingBookTitleEditor = false
     @State private var editingBookTitle = ""
     @State private var editingBookIndex: Int?
@@ -395,6 +443,9 @@ struct SideMenuView: View {
                             },
                             onDelete: {
                                 onDeleteNote(index)
+                            },
+                            onUpdate: { newTitle in
+                                onUpdateNote(index, newTitle)
                             }
                         )
                     }
@@ -427,6 +478,7 @@ struct NoteListItemView: View {
     let isSelected: Bool
     let onTap: () -> Void
     let onDelete: () -> Void
+    let onUpdate: (String) -> Void
     @State private var showingTitleEditor = false
     @State private var editingTitle = ""
     
@@ -449,9 +501,19 @@ struct NoteListItemView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 
-                Text(note.createdAt, style: .date)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                HStack {
+                    Text("作成:")
+                    Text(note.createdAt, style: .date)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+                HStack {
+                    Text("編集:")
+                    Text(note.updatedAt, style: .date)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
             }
             
             Spacer()
@@ -472,7 +534,7 @@ struct NoteListItemView: View {
             TitleEditorView(
                 title: $editingTitle,
                 onSave: { newTitle in
-                    note.title = newTitle
+                    onUpdate(newTitle)
                 },
                 onCancel: {
                     showingTitleEditor = false
@@ -485,15 +547,18 @@ struct NoteListItemView: View {
 // ノートキャンバスビュー
 struct NoteCanvasView: View {
     @Binding var note: Note
+    let canvasManager: CanvasManager
     let onNoteChanged: () -> Void
     
     var body: some View {
         PKCanvasViewRepresentable(
             note: $note,
+            canvasManager: canvasManager,
             onDrawingChanged: { recognizedText in
                 if !recognizedText.isEmpty && note.title == "新しいメモ" {
                     note.title = recognizedText
                 }
+                note.updatedAt = Date()
                 onNoteChanged()
             }
         )
@@ -557,15 +622,22 @@ struct NoteCanvasView: View {
 // PencilKitキャンバスビューのラッパー
 struct PKCanvasViewRepresentable: UIViewRepresentable {
     @Binding var note: Note
+    let canvasManager: CanvasManager
     let onDrawingChanged: (String) -> Void
     
     func makeUIView(context: Context) -> PKCanvasView {
         let canvasView = PKCanvasView()
         
-        // ツールと背景色を設定
-        canvasView.tool = PKInkingTool(.pen, color: .black, width: 2)
         canvasView.backgroundColor = .white
         canvasView.delegate = context.coordinator
+        
+        // CanvasManagerにUndoManagerを接続
+        canvasManager.undoManager = canvasView.undoManager
+        
+        // PKToolPickerのセットアップ
+        context.coordinator.toolPicker.setVisible(true, forFirstResponder: canvasView)
+        context.coordinator.toolPicker.addObserver(canvasView)
+        canvasView.becomeFirstResponder()
         
         // Apple Pencilと指での描画を有効にする設定
         canvasView.drawingPolicy = .anyInput
@@ -596,18 +668,26 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
         }
     }
     
+    func dismantleUIView(_ uiView: PKCanvasView, coordinator: Coordinator) {
+        coordinator.toolPicker.setVisible(false, forFirstResponder: uiView)
+        coordinator.toolPicker.removeObserver(uiView)
+    }
+    
     func makeCoordinator() -> Coordinator {
-        Coordinator(self, onDrawingChanged: onDrawingChanged)
+        Coordinator(self, canvasManager: canvasManager, onDrawingChanged: onDrawingChanged)
     }
     
     class Coordinator: NSObject, PKCanvasViewDelegate {
         let parent: PKCanvasViewRepresentable
+        let canvasManager: CanvasManager
         var lastNoteID: UUID?
         private var isUpdating = false
         private let onDrawingChanged: (String) -> Void
+        let toolPicker = PKToolPicker()
 
-        init(_ parent: PKCanvasViewRepresentable, onDrawingChanged: @escaping (String) -> Void) {
+        init(_ parent: PKCanvasViewRepresentable, canvasManager: CanvasManager, onDrawingChanged: @escaping (String) -> Void) {
             self.parent = parent
+            self.canvasManager = canvasManager
             self.onDrawingChanged = onDrawingChanged
         }
         
@@ -619,6 +699,7 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
             // 安全に描画データを更新
             DispatchQueue.main.async {
                 self.parent.note.drawingData = canvasView.drawing.dataRepresentation()
+                self.canvasManager.updateUndoRedoState()
                 
                 // OCRを実行してタイトルを更新
                 self.performOCR(on: canvasView) { recognizedText in
@@ -681,6 +762,7 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
 struct PageFlipView: View {
     let notes: [Note]
     @Binding var currentIndex: Int
+    let canvasManager: CanvasManager
     let onNoteChanged: () -> Void
     let onAddPage: () -> Void
     
@@ -763,6 +845,7 @@ struct PageFlipView: View {
                     if prevIndex >= 0 && prevIndex < notes.count {
                         NoteCanvasView(
                             note: .constant(notes[prevIndex]),
+                            canvasManager: canvasManager,
                             onNoteChanged: onNoteChanged
                         )
                         .id(notes[prevIndex].id) // IDを追加してビューを再生成
@@ -801,6 +884,7 @@ struct PageFlipView: View {
                                 onNoteChanged()
                             }
                         ),
+                        canvasManager: canvasManager,
                         onNoteChanged: onNoteChanged
                     )
                     .id(notes[safeCurrentIndex].id) // IDを追加してビューを再生成
@@ -821,6 +905,7 @@ struct PageFlipView: View {
                     if nextIndex >= 0 && nextIndex < notes.count {
                         NoteCanvasView(
                             note: .constant(notes[nextIndex]),
+                            canvasManager: canvasManager,
                             onNoteChanged: onNoteChanged
                         )
                         .id(notes[nextIndex].id) // IDを追加してビューを再生成
@@ -1011,6 +1096,7 @@ struct TitleEditorView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("保存") {
                         onSave(tempTitle.isEmpty ? "新しいメモ" : tempTitle)
+                        onCancel() // 保存後にビューを閉じる
                     }
                     .disabled(tempTitle.isEmpty)
                 }
@@ -1099,6 +1185,14 @@ class NoteManager: ObservableObject {
         saveNotes()
     }
     
+    func updateNoteTitle(at index: Int, newTitle: String) {
+        guard index >= 0 && index < notes.count else { return }
+        notes[index].title = newTitle
+        notes[index].updatedAt = Date()
+        noteBook.notes = notes
+        saveNotes()
+    }
+    
     func mergeAllPages() {
         // 全ページをマージする機能（実装は省略）
     }
@@ -1127,6 +1221,7 @@ class Note: ObservableObject, Identifiable, Codable {
     let id: UUID
     @Published var title: String
     @Published var createdAt: Date
+    @Published var updatedAt: Date
     
     // PKCanvasViewの描画データをData型で保持
     var drawingData: Data
@@ -1138,6 +1233,7 @@ class Note: ObservableObject, Identifiable, Codable {
         self.id = UUID() // ここでidを生成
         self.title = title
         self.createdAt = createdAt
+        self.updatedAt = createdAt
         self.drawingData = drawingData
         // self.canvasView = PKCanvasView()
         // self.canvasView.drawing = try! PKDrawing(data: drawingData)
@@ -1147,7 +1243,7 @@ class Note: ObservableObject, Identifiable, Codable {
 
     // CodableのためのCodingKeys
     enum CodingKeys: String, CodingKey {
-        case id, title, createdAt, drawingData
+        case id, title, createdAt, updatedAt, drawingData
     }
     
     // Decodableのためのイニシャライザ
@@ -1155,7 +1251,9 @@ class Note: ObservableObject, Identifiable, Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
-        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        let creationDate = try container.decode(Date.self, forKey: .createdAt)
+        createdAt = creationDate
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? creationDate
         drawingData = try container.decode(Data.self, forKey: .drawingData)
     }
 
@@ -1165,6 +1263,7 @@ class Note: ObservableObject, Identifiable, Codable {
         try container.encode(id, forKey: .id)
         try container.encode(title, forKey: .title)
         try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
         try container.encode(drawingData, forKey: .drawingData)
     }
 }
