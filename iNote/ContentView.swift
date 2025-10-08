@@ -21,7 +21,18 @@ struct ContentView: View {
     
     // 現在のノートブックのメモを取得
     private var noteManager: NoteManager {
-        let manager = NoteManager(noteBook: noteBookManager.noteBooks.isEmpty ? NoteBook() : noteBookManager.noteBooks[noteBookManager.selectedNoteBookIndex])
+        let index = noteBookManager.selectedNoteBookIndex
+        let noteBooks = noteBookManager.noteBooks
+        
+        let selectedNoteBook: NoteBook
+        if !noteBooks.isEmpty && index >= 0 && index < noteBooks.count {
+            selectedNoteBook = noteBooks[index]
+        } else {
+            // 選択可能なノートブックがない場合は、空のノートブックを一時的に使用
+            selectedNoteBook = NoteBook()
+        }
+        
+        let manager = NoteManager(noteBook: selectedNoteBook)
         manager.setNoteBookManager(noteBookManager)
         return manager
     }
@@ -32,6 +43,7 @@ struct ContentView: View {
                 // サイドメニュー
                 if showingSideMenu {
                     SideMenuView(
+                        noteBookManager: noteBookManager,
                         notes: noteManager.notes,
                         selectedIndex: $selectedNoteIndex,
                         onAddNote: {
@@ -246,6 +258,9 @@ struct ContentView: View {
                 }
             }
         }
+        .onChange(of: noteBookManager.selectedNoteBookIndex) { _ in
+            selectedNoteIndex = 0
+        }
         .onAppear {
             print("ContentView onAppear - noteBooks count: \(noteBookManager.noteBooks.count)")
             // データを読み込む
@@ -276,15 +291,70 @@ struct ContentView: View {
 
 // サイドメニュービュー
 struct SideMenuView: View {
+    @ObservedObject var noteBookManager: NoteBookManager
     let notes: [Note]
     @Binding var selectedIndex: Int
     let onAddNote: () -> Void
     let onAddPage: () -> Void
     let onMergePages: () -> Void
     let onDeleteNote: (Int) -> Void
-    
+    @State private var showingBookTitleEditor = false
+    @State private var editingBookTitle = ""
+    @State private var editingBookIndex: Int?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("ノート")
+                    .font(.title2)
+                    .fontWeight(.bold)
+                Spacer()
+                Button(action: {
+                    noteBookManager.addNoteBook()
+                }) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.title2)
+                        .foregroundColor(.black)
+                }
+            }
+            .padding()
+
+            List {
+                Section(header: Text("ノートブック")) {
+                    ForEach(Array(noteBookManager.noteBooks.enumerated()), id: \.element.id) { index, book in
+                        HStack {
+                            Button(action: {
+                                noteBookManager.selectedNoteBookIndex = index
+                            }) {
+                                HStack {
+                                    Image(systemName: noteBookManager.selectedNoteBookIndex == index ? "folder.fill" : "folder")
+                                    Text(book.title)
+                                }
+                                .foregroundColor(noteBookManager.selectedNoteBookIndex == index ? .blue : .primary)
+                            }
+
+                            Spacer()
+
+                            Button(action: {
+                                self.editingBookIndex = index
+                                self.editingBookTitle = book.title
+                                self.showingBookTitleEditor = true
+                            }) {
+                                Image(systemName: "pencil")
+                                    .foregroundColor(.gray)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                    }
+                    .onDelete { indexSet in
+                        indexSet.forEach { index in
+                            noteBookManager.deleteNoteBook(at: index)
+                        }
+                    }
+                }
+            }
+            .listStyle(InsetGroupedListStyle())
+            
             HStack {
                 Text("メモ一覧")
                     .font(.title2)
@@ -296,13 +366,13 @@ struct SideMenuView: View {
                             .font(.title2)
                             .foregroundColor(.black)
                     }
-                    
+
                     Button(action: onAddPage) {
                         Image(systemName: "doc.badge.plus")
                             .font(.title2)
                             .foregroundColor(.black)
                     }
-                    
+
                     Button(action: onMergePages) {
                         Image(systemName: "doc.on.doc")
                             .font(.title2)
@@ -311,7 +381,7 @@ struct SideMenuView: View {
                 }
             }
             .padding()
-            
+
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
@@ -333,6 +403,21 @@ struct SideMenuView: View {
             }
         }
         .background(Color(.systemGray6))
+        .sheet(isPresented: $showingBookTitleEditor) {
+            if let index = editingBookIndex {
+                TitleEditorView(
+                    title: $editingBookTitle,
+                    onSave: { newTitle in
+                        noteBookManager.noteBooks[index].title = newTitle
+                        noteBookManager.saveNoteBooks()
+                        showingBookTitleEditor = false
+                    },
+                    onCancel: {
+                        showingBookTitleEditor = false
+                    }
+                )
+            }
+        }
     }
 }
 
@@ -988,12 +1073,6 @@ class NoteManager: ObservableObject {
         notes.append(newNote)
         noteBook.notes = notes
         print("addNote() completed - new notes count: \(notes.count)")
-        
-        // SwiftUIの更新を確実にする
-        DispatchQueue.main.async {
-            self.objectWillChange.send()
-        }
-        
         saveNotes()
     }
     
@@ -1008,12 +1087,6 @@ class NoteManager: ObservableObject {
         guard notes.count > 0 else {
             print("Error: notes array is empty after adding page")
             return
-        }
-        
-        // SwiftUIの更新を確実にする
-        DispatchQueue.main.async {
-            self.objectWillChange.send()
-            print("NoteManager objectWillChange sent - notes count: \(self.notes.count)")
         }
         
         saveNotes()
@@ -1098,8 +1171,24 @@ class Note: ObservableObject, Identifiable, Codable {
 
 // ノートブックマネージャー
 class NoteBookManager: ObservableObject {
-    @Published var noteBooks: [NoteBook] = []
+    @Published var noteBooks: [NoteBook] = [] {
+        didSet {
+            setupNoteBookSubscriptions()
+        }
+    }
     @Published var selectedNoteBookIndex: Int = 0
+    private var cancellables = Set<AnyCancellable>()
+
+    private func setupNoteBookSubscriptions() {
+        cancellables.removeAll()
+        noteBooks.forEach { noteBook in
+            noteBook.objectWillChange
+                .sink { [weak self] _ in
+                    self?.objectWillChange.send()
+                }
+                .store(in: &cancellables)
+        }
+    }
     
     func addNoteBook() {
         print("addNoteBook() called")
