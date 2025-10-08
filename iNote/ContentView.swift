@@ -21,7 +21,9 @@ struct ContentView: View {
     
     // 現在のノートブックのメモを取得
     private var noteManager: NoteManager {
-        NoteManager(noteBook: noteBookManager.noteBooks.isEmpty ? NoteBook() : noteBookManager.noteBooks[noteBookManager.selectedNoteBookIndex])
+        let manager = NoteManager(noteBook: noteBookManager.noteBooks.isEmpty ? NoteBook() : noteBookManager.noteBooks[noteBookManager.selectedNoteBookIndex])
+        manager.setNoteBookManager(noteBookManager)
+        return manager
     }
     
     var body: some View {
@@ -34,25 +36,19 @@ struct ContentView: View {
                         selectedIndex: $selectedNoteIndex,
                         onAddNote: {
                             noteManager.addNote()
-                            DispatchQueue.main.async {
-                                self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
-                            }
+                            self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
                         },
                         onAddPage: {
                             noteManager.addPage()
-                            DispatchQueue.main.async {
-                                self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
-                            }
+                            self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
                         },
                         onMergePages: {
                             noteManager.mergeAllPages()
                         },
                         onDeleteNote: { index in
                             noteManager.deleteNote(at: index)
-                            DispatchQueue.main.async {
-                                if self.selectedNoteIndex >= self.noteManager.notes.count {
-                                    self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
-                                }
+                            if self.selectedNoteIndex >= self.noteManager.notes.count {
+                                self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
                             }
                         }
                     )
@@ -134,9 +130,7 @@ struct ContentView: View {
                                     
                                     withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                                         noteManager.addPage()
-                                        DispatchQueue.main.async {
-                                            self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
-                                        }
+                                        self.selectedNoteIndex = max(0, self.noteManager.notes.count - 1)
                                     }
                                 }) {
                                     HStack(spacing: 6) {
@@ -169,10 +163,17 @@ struct ContentView: View {
                                 noteManager.saveNotes()
                             },
                             onAddPage: {
+                                print("Adding new page - current notes count: \(noteManager.notes.count)")
                                 noteManager.addPage()
                                 // 新しいページが追加された後、インデックスを最後のページに設定
-                                DispatchQueue.main.async {
-                                    self.selectedNoteIndex = self.noteManager.notes.count - 1
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    let newIndex = self.noteManager.notes.count - 1
+                                    guard newIndex >= 0 && newIndex < self.noteManager.notes.count else {
+                                        print("Error: Invalid index \(newIndex) for notes count \(self.noteManager.notes.count)")
+                                        return
+                                    }
+                                    self.selectedNoteIndex = newIndex
+                                    print("Page added - selectedNoteIndex updated to: \(self.selectedNoteIndex), notes count: \(self.noteManager.notes.count)")
                                 }
                             }
                         )
@@ -234,7 +235,7 @@ struct ContentView: View {
                             currentIndex: selectedNoteIndex,
                             totalPages: noteManager.notes.count,
                             onPageSelected: { index in
-                                withAnimation(.spring(response: 0.6, dampingFraction: 0.8, blendDuration: 0)) {
+                                withAnimation(.easeInOut(duration: 0.3)) {
                                     selectedNoteIndex = index
                                 }
                             }
@@ -247,6 +248,8 @@ struct ContentView: View {
         }
         .onAppear {
             print("ContentView onAppear - noteBooks count: \(noteBookManager.noteBooks.count)")
+            // データを読み込む
+            noteBookManager.loadNoteBooks()
             if noteBookManager.noteBooks.isEmpty {
                 print("Creating initial notebook")
                 noteBookManager.addNoteBook()
@@ -402,20 +405,20 @@ struct NoteCanvasView: View {
     var body: some View {
         PKCanvasViewRepresentable(
             note: $note,
-            onDrawingChanged: {
-                print("Drawing changed for note: \(note.title)")
-                onNoteChanged()
-                // 描画後にOCRを実行してタイトルを自動更新
-                performOCR(on: note.canvasView) { recognizedText in
-                    if !recognizedText.isEmpty && note.title == "新しいメモ" {
-                        note.title = recognizedText
-                    }
+            onDrawingChanged: { recognizedText in
+                if !recognizedText.isEmpty && note.title == "新しいメモ" {
+                    note.title = recognizedText
                 }
+                onNoteChanged()
             }
         )
         .background(Color.white)
+        .clipped()
         .onAppear {
             print("NoteCanvasView appeared for note: \(note.title)")
+        }
+        .onDisappear {
+            print("NoteCanvasView disappeared for note: \(note.title)")
         }
     }
     
@@ -427,8 +430,7 @@ struct NoteCanvasView: View {
             return
         }
         
-        // PKCanvasViewの描画をUIImageに変換
-        let image = drawing.image(from: canvasView.bounds, scale: 2.0) // 高解像度で変換
+        let image = drawing.image(from: canvasView.bounds, scale: 2.0)
         
         guard let cgImage = image.cgImage else {
             completion("")
@@ -441,35 +443,17 @@ struct NoteCanvasView: View {
                 return
             }
             
-            // 複数の候補を取得し、最も信頼度の高いものを選択
-            var allTexts: [(String, Float)] = []
-            
-            for observation in observations {
-                for candidate in observation.topCandidates(3) {
-                    allTexts.append((candidate.string, candidate.confidence))
-                }
-            }
-            
-            // 信頼度でソートし、最も信頼度の高いテキストを選択
-            let sortedTexts = allTexts.sorted { $0.1 > $1.1 }
-            
-            // 最初の数行を結合してタイトルとして使用（改行で区切られた最初の部分）
-            let title = sortedTexts.first?.0 ?? ""
-            let cleanTitle = title.components(separatedBy: .newlines).first ?? title
+            let recognizedStrings = observations.compactMap { $0.topCandidates(1).first?.string }
+            let title = recognizedStrings.joined(separator: "\n").components(separatedBy: .newlines).first ?? ""
             
             DispatchQueue.main.async {
-                completion(cleanTitle)
+                completion(title)
             }
         }
         
-        // より高精度な設定
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
-        
-        // 日本語と英語の両方をサポート（iOS 13.0以降）
-        if #available(iOS 13.0, *) {
-            request.recognitionLanguages = ["ja", "en"]
-        }
+        request.recognitionLanguages = ["ja", "en"]
         
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         
@@ -488,7 +472,7 @@ struct NoteCanvasView: View {
 // PencilKitキャンバスビューのラッパー
 struct PKCanvasViewRepresentable: UIViewRepresentable {
     @Binding var note: Note
-    let onDrawingChanged: () -> Void
+    let onDrawingChanged: (String) -> Void
     
     func makeUIView(context: Context) -> PKCanvasView {
         let canvasView = PKCanvasView()
@@ -500,51 +484,46 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
         
         // Apple Pencilと指での描画を有効にする設定
         canvasView.drawingPolicy = .anyInput
-        canvasView.isOpaque = false
+        canvasView.isOpaque = true // 背景を不透明に
         canvasView.allowsFingerDrawing = true
-        
-        // タッチとペンの両方を有効にする
-        canvasView.isUserInteractionEnabled = true
-        canvasView.isMultipleTouchEnabled = true
-        
-        // フレームを明示的に設定
-        canvasView.frame = CGRect(x: 0, y: 0, width: 100, height: 100)
         
         // 既存の描画データを安全に設定
         do {
-            canvasView.drawing = note.canvasView.drawing
-            print("Canvas drawing data set successfully")
+            canvasView.drawing = try PKDrawing(data: note.drawingData)
         } catch {
             print("描画データの設定エラー: \(error)")
             canvasView.drawing = PKDrawing()
         }
         
-        print("PKCanvasView created with frame: \(canvasView.frame)")
         return canvasView
     }
     
     func updateUIView(_ uiView: PKCanvasView, context: Context) {
-        // 描画データが変更された場合のみ安全に更新
-        do {
-            if uiView.drawing != note.canvasView.drawing {
-                print("Updating canvas drawing data")
-                uiView.drawing = note.canvasView.drawing
+        // note ID が変更された場合、または描画データが異なる場合にキャンバスを更新
+        if context.coordinator.lastNoteID != note.id {
+            do {
+                uiView.drawing = try PKDrawing(data: note.drawingData)
+                context.coordinator.lastNoteID = note.id
+            } catch {
+                print("描画データのリセットエラー: \(error)")
+                uiView.drawing = PKDrawing()
             }
-        } catch {
-            print("描画データの更新エラー: \(error)")
         }
     }
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+        Coordinator(self, onDrawingChanged: onDrawingChanged)
     }
     
     class Coordinator: NSObject, PKCanvasViewDelegate {
         let parent: PKCanvasViewRepresentable
+        var lastNoteID: UUID?
         private var isUpdating = false
-        
-        init(_ parent: PKCanvasViewRepresentable) {
+        private let onDrawingChanged: (String) -> Void
+
+        init(_ parent: PKCanvasViewRepresentable, onDrawingChanged: @escaping (String) -> Void) {
             self.parent = parent
+            self.onDrawingChanged = onDrawingChanged
         }
         
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
@@ -554,13 +533,60 @@ struct PKCanvasViewRepresentable: UIViewRepresentable {
             
             // 安全に描画データを更新
             DispatchQueue.main.async {
-                do {
-                    self.parent.note.canvasView.drawing = canvasView.drawing
-                    self.parent.onDrawingChanged()
-                } catch {
-                    print("描画データの保存エラー: \(error)")
+                self.parent.note.drawingData = canvasView.drawing.dataRepresentation()
+                
+                // OCRを実行してタイトルを更新
+                self.performOCR(on: canvasView) { recognizedText in
+                    self.onDrawingChanged(recognizedText)
                 }
+
                 self.isUpdating = false
+            }
+        }
+
+        // OCR機能
+        private func performOCR(on canvasView: PKCanvasView, completion: @escaping (String) -> Void) {
+            let drawing = canvasView.drawing
+            guard !drawing.strokes.isEmpty else {
+                completion("")
+                return
+            }
+            
+            let image = drawing.image(from: canvasView.bounds, scale: 2.0)
+            
+            guard let cgImage = image.cgImage else {
+                completion("")
+                return
+            }
+            
+            let request = VNRecognizeTextRequest { request, error in
+                guard let observations = request.results as? [VNRecognizedTextObservation] else {
+                    completion("")
+                    return
+                }
+                
+                let recognizedStrings = observations.compactMap { $0.topCandidates(1).first?.string }
+                let title = recognizedStrings.joined(separator: "\n").components(separatedBy: .newlines).first ?? ""
+                
+                DispatchQueue.main.async {
+                    completion(title)
+                }
+            }
+            
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = ["ja", "en"]
+            
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try handler.perform([request])
+                } catch {
+                    DispatchQueue.main.async {
+                        completion("")
+                    }
+                }
             }
         }
     }
@@ -576,125 +602,255 @@ struct PageFlipView: View {
     @State private var dragOffset: CGFloat = 0
     @State private var isDragging = false
     @State private var pageRotation: Double = 0
+    @State private var isTransitioning = false
+    @State private var previousIndex: Int = -1  // 無効なインデックスで初期化
+    @State private var pageTransitionOpacity: Double = 1.0  // ページ切り替え時の透明度
     
     // 安全なインデックス取得
     private var safeCurrentIndex: Int {
-        guard !notes.isEmpty else { return 0 }
-        return max(0, min(currentIndex, notes.count - 1))
+        guard !notes.isEmpty else { 
+            print("Warning: notes array is empty")
+            return 0 
+        }
+        let safeIndex = max(0, min(currentIndex, notes.count - 1))
+        if safeIndex != currentIndex {
+            print("Warning: currentIndex \(currentIndex) adjusted to safeIndex \(safeIndex) for notes.count \(notes.count)")
+        }
+        return safeIndex
     }
     
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // 現在のページ
+                // 背景色を設定
+                Color(.systemGray6)
+                    .ignoresSafeArea()
+                    .zIndex(-1)
+                
+                // ページの境界線（常に表示）
+                VStack {
+                    // 上部の境界線
+                    Rectangle()
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: 1)
+                        .offset(y: -geometry.size.height / 2)
+                    
+                    // 下部の境界線
+                    Rectangle()
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: 1)
+                        .offset(y: geometry.size.height / 2)
+                }
+                .zIndex(1)
+                
+                // ページ仕切り線（常に表示）
+                Rectangle()
+                    .fill(Color.black.opacity(0.4))
+                    .frame(width: 2)
+                    .offset(x: geometry.size.width / 2)
+                    .zIndex(2)
+                
+                // ページ番号表示（常に表示）
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Text("\(safeCurrentIndex + 1) / \(notes.count)")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(Color.white.opacity(0.9))
+                                    .shadow(color: .black.opacity(0.1), radius: 2, x: 0, y: 1)
+                            )
+                            .padding(.trailing, 20)
+                            .padding(.bottom, 20)
+                    }
+                }
+                .zIndex(3)
+                
+                // 前のページ（左側に表示）
+                if !notes.isEmpty && safeCurrentIndex > 0 {
+                    let prevIndex = safeCurrentIndex - 1
+                    if prevIndex >= 0 && prevIndex < notes.count {
+                        NoteCanvasView(
+                            note: .constant(notes[prevIndex]),
+                            onNoteChanged: onNoteChanged
+                        )
+                        .id(notes[prevIndex].id) // IDを追加してビューを再生成
+                        .frame(width: geometry.size.width - 4, height: geometry.size.height - 4)
+                        .background(Color.white)
+                        .cornerRadius(8)
+                        .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
+                        .offset(x: -geometry.size.width + dragOffset)
+                        .scaleEffect(0.95)
+                        .opacity(0.7)
+                        .zIndex(0)
+                        .clipped()
+                    }
+                }
+                
+                // 現在のページ（中央に表示）
                 if !notes.isEmpty && safeCurrentIndex < notes.count {
                     NoteCanvasView(
                         note: Binding(
                             get: { 
                                 guard safeCurrentIndex >= 0 && safeCurrentIndex < notes.count else {
+                                    print("Warning: safeCurrentIndex \(safeCurrentIndex) is out of range for notes.count \(notes.count)")
                                     return Note()
                                 }
                                 return notes[safeCurrentIndex] 
                             },
                             set: { newNote in
                                 // 描画データを安全に保存
-                                guard safeCurrentIndex >= 0 && safeCurrentIndex < notes.count else { return }
-                                DispatchQueue.main.async {
-                                    notes[safeCurrentIndex].canvasView.drawing = newNote.canvasView.drawing
-                                    notes[safeCurrentIndex].title = newNote.title
-                                    onNoteChanged()
+                                guard safeCurrentIndex >= 0 && safeCurrentIndex < notes.count else { 
+                                    print("Warning: Cannot update note at index \(safeCurrentIndex) - out of range for notes.count \(notes.count)")
+                                    return 
                                 }
+                                print("Updating note at index \(safeCurrentIndex) with title: \(newNote.title)")
+                                notes[safeCurrentIndex].drawingData = newNote.drawingData
+                                notes[safeCurrentIndex].title = newNote.title
+                                onNoteChanged()
                             }
                         ),
                         onNoteChanged: onNoteChanged
                     )
-                    .scaleEffect(isDragging ? 0.95 : 1.0)
+                    .id(notes[safeCurrentIndex].id) // IDを追加してビューを再生成
+                    .frame(width: geometry.size.width - 4, height: geometry.size.height - 4)
+                    .background(Color.white)
+                    .cornerRadius(8)
+                    .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
+                    .scaleEffect(isDragging ? 0.98 : 1.0)
                     .offset(x: dragOffset)
-                    .rotation3DEffect(
-                        .degrees(pageRotation),
-                        axis: (x: 0, y: 1, z: 0),
-                        perspective: 0.5
-                    )
+                    .opacity(pageTransitionOpacity)
                     .zIndex(2)
+                    .clipped()
                 }
                 
-                // 前のページ（右側に隠れている）
-                if safeCurrentIndex > 0 && safeCurrentIndex - 1 < notes.count {
-                    NoteCanvasView(
-                        note: .constant(notes[safeCurrentIndex - 1]),
-                        onNoteChanged: onNoteChanged
-                    )
-                    .offset(x: -geometry.size.width + dragOffset)
-                    .rotation3DEffect(
-                        .degrees(-15 + pageRotation * 0.3),
-                        axis: (x: 0, y: 1, z: 0),
-                        perspective: 0.5
-                    )
-                    .zIndex(1)
-                }
-                
-                // 次のページ（左側に隠れている）
-                if safeCurrentIndex >= 0 && safeCurrentIndex + 1 < notes.count {
-                    NoteCanvasView(
-                        note: .constant(notes[safeCurrentIndex + 1]),
-                        onNoteChanged: onNoteChanged
-                    )
-                    .offset(x: geometry.size.width + dragOffset)
-                    .rotation3DEffect(
-                        .degrees(15 - pageRotation * 0.3),
-                        axis: (x: 0, y: 1, z: 0),
-                        perspective: 0.5
-                    )
-                    .zIndex(1)
+                // 次のページ（右側に表示）
+                if !notes.isEmpty && safeCurrentIndex >= 0 && safeCurrentIndex + 1 < notes.count {
+                    let nextIndex = safeCurrentIndex + 1
+                    if nextIndex >= 0 && nextIndex < notes.count {
+                        NoteCanvasView(
+                            note: .constant(notes[nextIndex]),
+                            onNoteChanged: onNoteChanged
+                        )
+                        .id(notes[nextIndex].id) // IDを追加してビューを再生成
+                        .frame(width: geometry.size.width - 4, height: geometry.size.height - 4)
+                        .background(Color.white)
+                        .cornerRadius(8)
+                        .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
+                        .offset(x: geometry.size.width + dragOffset)
+                        .scaleEffect(0.95)
+                        .opacity(0.7)
+                        .zIndex(0)
+                        .clipped()
+                    }
                 }
             }
             .clipped()
+            .onChange(of: currentIndex) { newIndex in
+                // ジェスチャーによるページ切り替え中は、このアニメーションを実行しない
+                guard !isTransitioning else { return }
+
+                // インデックスが変更された時にアニメーションを実行
+                isTransitioning = true
+                
+                // PageViewControllerスタイルのページ切り替えアニメーション
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    pageTransitionOpacity = 0.8
+                }
+                
+                // 安全な範囲内でのみpreviousIndexを更新
+                if safeCurrentIndex >= 0 && safeCurrentIndex < notes.count {
+                    previousIndex = safeCurrentIndex
+                }
+                
+                // ページ切り替え完了後の処理
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        pageTransitionOpacity = 1.0
+                    }
+                }
+                
+                // アニメーション完了後に状態をリセット
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    isTransitioning = false
+                }
+            }
             .gesture(
                 DragGesture()
                     .onChanged { value in
+                        guard !isTransitioning else { return }
                         isDragging = true
                         dragOffset = value.translation.width
                         
                         // ドラッグに応じてページの回転を計算
                         let progress = min(abs(value.translation.width) / geometry.size.width, 1.0)
-                        pageRotation = progress * 15 * (value.translation.width > 0 ? -1 : 1)
+                        pageRotation = progress * 10 * (value.translation.width > 0 ? -1 : 1)
+                        
+                        // ドラッグ中は透明度を調整してページ間の境界を明確にする
+                        pageTransitionOpacity = 1.0 - (progress * 0.3)
                     }
                     .onEnded { value in
-                        let threshold: CGFloat = geometry.size.width * 0.2
+                        guard !isTransitioning else { return }
+                        isTransitioning = true
+
+                        let translation = value.translation.width
                         let velocity = value.velocity.width
-                        
-                        withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
-                            print("Swipe detected - translation: \(value.translation.width), velocity: \(velocity), threshold: \(threshold)")
-                            print("Current index: \(safeCurrentIndex), notes count: \(notes.count)")
-                            
-                            if value.translation.width > threshold || velocity > 300 {
-                                // 右スワイプ - 前のページ
-                                print("Right swipe - going to previous page")
-                                if safeCurrentIndex > 0 {
-                                    currentIndex = max(0, safeCurrentIndex - 1)
-                                    print("Updated currentIndex to: \(currentIndex)")
-                                }
-                            } else if value.translation.width < -threshold || velocity < -300 {
-                                // 左スワイプ - 次のページ
-                                print("Left swipe - going to next page")
-                                if safeCurrentIndex < notes.count - 1 {
-                                    currentIndex = min(notes.count - 1, safeCurrentIndex + 1)
-                                    print("Updated currentIndex to: \(currentIndex)")
-                                } else if safeCurrentIndex == notes.count - 1 {
-                                    // 最後のページで左スワイプ - 新しいページを追加
-                                    print("Last page - adding new page")
-                                    onAddPage()
-                                    // 新しいページが追加された後にインデックスを最後のページに設定
-                                    DispatchQueue.main.async {
-                                        currentIndex = notes.count - 1
-                                        print("Updated currentIndex to: \(currentIndex)")
-                                    }
-                                }
+                        let geometryWidth = geometry.size.width
+
+                        // 慣性を考慮したスワイプ終了位置の予測
+                        let predictedEndTranslation = translation + velocity * 0.1
+
+                        var targetIndex = safeCurrentIndex
+
+                        // ページ切り替えの閾値（画面幅の半分）
+                        let switchThreshold = geometryWidth / 2
+
+                        // 予測位置に基づいて目標インデックスを決定
+                        if predictedEndTranslation < -switchThreshold && safeCurrentIndex < notes.count - 1 {
+                            targetIndex += 1
+                        } else if predictedEndTranslation > switchThreshold && safeCurrentIndex > 0 {
+                            targetIndex -= 1
+                        }
+
+                        // 最後のページで新しいページを追加する処理
+                        if safeCurrentIndex == notes.count - 1 && translation < -geometryWidth / 4 {
+                            onAddPage()
+                            // 元の位置に戻るアニメーション
+                            withAnimation(.interpolatingSpring(stiffness: 170, damping: 30)) {
+                                dragOffset = 0
+                                isDragging = false
                             }
-                            
-                            dragOffset = 0
-                            pageRotation = 0
+                            // 状態リセット
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                self.isTransitioning = false
+                            }
+                            return
+                        }
+
+                        // dragOffset の目標値を計算
+                        // (現在のインデックス - 目標インデックス) * 画面幅
+                        let targetOffset = CGFloat(safeCurrentIndex - targetIndex) * geometryWidth
+
+                        // スプリングアニメーションで目標オフセットまで移動
+                        withAnimation(.interpolatingSpring(stiffness: 170, damping: 30)) {
+                            dragOffset = targetOffset
                             isDragging = false
+                            pageRotation = 0
+                            pageTransitionOpacity = 1.0
+                        }
+
+                        // アニメーション完了後に状態を更新・リセット
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            self.currentIndex = targetIndex
+                            // アニメーションなしで dragOffset をリセット
+                            self.dragOffset = 0
+                            self.isTransitioning = false
                         }
                     }
             )
@@ -712,7 +868,7 @@ struct PageIndicatorView: View {
         HStack(spacing: 12) {
             ForEach(0..<totalPages, id: \.self) { index in
                 Button(action: {
-                    withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
                         onPageSelected(index)
                     }
                 }) {
@@ -779,16 +935,40 @@ struct TitleEditorView: View {
 }
 
 // ノートブック（ファイル）データモデル
-class NoteBook: ObservableObject, Identifiable {
-    let id = UUID()
+class NoteBook: ObservableObject, Identifiable, Codable {
+    let id: UUID
     @Published var title: String
     @Published var createdAt: Date
     @Published var notes: [Note]
     
-    init(title: String = "新しいノートブック", createdAt: Date = Date()) {
+    init(title: String = "新しいノートブック", createdAt: Date = Date(), notes: [Note] = []) {
+        self.id = UUID()
         self.title = title
         self.createdAt = createdAt
-        self.notes = []
+        self.notes = notes
+    }
+
+    // CodableのためのCodingKeys
+    enum CodingKeys: String, CodingKey {
+        case id, title, createdAt, notes
+    }
+    
+    // Decodableのためのイニシャライザ
+    required init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        notes = try container.decode([Note].self, forKey: .notes)
+    }
+
+    // Encodableのためのメソッド
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(notes, forKey: .notes)
     }
 }
 
@@ -818,7 +998,25 @@ class NoteManager: ObservableObject {
     }
     
     func addPage() {
-        addNote()
+        print("addPage() called - current notes count: \(notes.count)")
+        let newNote = Note()
+        notes.append(newNote)
+        noteBook.notes = notes
+        print("addPage() completed - new notes count: \(notes.count)")
+        
+        // 配列の整合性を確認
+        guard notes.count > 0 else {
+            print("Error: notes array is empty after adding page")
+            return
+        }
+        
+        // SwiftUIの更新を確実にする
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+            print("NoteManager objectWillChange sent - notes count: \(self.notes.count)")
+        }
+        
+        saveNotes()
     }
     
     func deleteNote(at index: Int) {
@@ -834,6 +1032,16 @@ class NoteManager: ObservableObject {
     
     func saveNotes() {
         noteBook.notes = notes
+        // NoteBookManagerの保存も呼び出す
+        if let noteBookManager = noteBookManager {
+            noteBookManager.saveNoteBooks()
+        }
+    }
+    
+    private weak var noteBookManager: NoteBookManager?
+    
+    func setNoteBookManager(_ manager: NoteBookManager) {
+        self.noteBookManager = manager
     }
     
     func loadNotes() {
@@ -842,16 +1050,49 @@ class NoteManager: ObservableObject {
 }
 
 // ノートデータモデル
-class Note: ObservableObject, Identifiable {
-    let id = UUID()
+class Note: ObservableObject, Identifiable, Codable {
+    let id: UUID
     @Published var title: String
     @Published var createdAt: Date
-    let canvasView: PKCanvasView
     
-    init(title: String = "新しいメモ", createdAt: Date = Date()) {
+    // PKCanvasViewの描画データをData型で保持
+    var drawingData: Data
+    
+    // PKCanvasViewは表示のたびに生成するため、Noteモデルに保持しない
+    // let canvasView: PKCanvasView
+    
+    init(title: String = "新しいメモ", createdAt: Date = Date(), drawingData: Data = Data()) {
+        self.id = UUID() // ここでidを生成
         self.title = title
         self.createdAt = createdAt
-        self.canvasView = PKCanvasView()
+        self.drawingData = drawingData
+        // self.canvasView = PKCanvasView()
+        // self.canvasView.drawing = try! PKDrawing(data: drawingData)
+        
+        // print("New Note created with title: \(title)")
+    }
+
+    // CodableのためのCodingKeys
+    enum CodingKeys: String, CodingKey {
+        case id, title, createdAt, drawingData
+    }
+    
+    // Decodableのためのイニシャライザ
+    required init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        drawingData = try container.decode(Data.self, forKey: .drawingData)
+    }
+
+    // Encodableのためのメソッド
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(drawingData, forKey: .drawingData)
     }
 }
 
@@ -909,21 +1150,7 @@ class NoteBookManager: ObservableObject {
     func saveNoteBooks() {
         do {
             let encoder = JSONEncoder()
-            let noteBooksData = try encoder.encode(noteBooks.map { noteBook in
-                NoteBookData(
-                    id: noteBook.id,
-                    title: noteBook.title,
-                    createdAt: noteBook.createdAt,
-                    notes: noteBook.notes.map { note in
-                        NoteData(
-                            id: note.id,
-                            title: note.title,
-                            createdAt: note.createdAt,
-                            drawingData: note.canvasView.drawing.dataRepresentation()
-                        )
-                    }
-                )
-            })
+            let noteBooksData = try encoder.encode(noteBooks)
             UserDefaults.standard.set(noteBooksData, forKey: "savedNoteBooks")
         } catch {
             print("保存エラー: \(error)")
@@ -935,24 +1162,10 @@ class NoteBookManager: ObservableObject {
         
         do {
             let decoder = JSONDecoder()
-            let savedNoteBooks = try decoder.decode([NoteBookData].self, from: noteBooksData)
+            let savedNoteBooks = try decoder.decode([NoteBook].self, from: noteBooksData)
             
             DispatchQueue.main.async {
-                self.noteBooks = savedNoteBooks.map { noteBookData in
-                    let noteBook = NoteBook(title: noteBookData.title, createdAt: noteBookData.createdAt)
-                    noteBook.notes = noteBookData.notes.map { noteData in
-                        let note = Note(title: noteData.title, createdAt: noteData.createdAt)
-                        do {
-                            let drawing = try PKDrawing(data: noteData.drawingData)
-                            note.canvasView.drawing = drawing
-                        } catch {
-                            print("描画データの読み込みエラー: \(error)")
-                            note.canvasView.drawing = PKDrawing()
-                        }
-                        return note
-                    }
-                    return noteBook
-                }
+                self.noteBooks = savedNoteBooks
             }
         } catch {
             print("読み込みエラー: \(error)")
@@ -960,20 +1173,9 @@ class NoteBookManager: ObservableObject {
     }
 }
 
-// データ保存用の構造体
-struct NoteBookData: Codable {
-    let id: UUID
-    let title: String
-    let createdAt: Date
-    let notes: [NoteData]
-}
-
-struct NoteData: Codable {
-    let id: UUID
-    let title: String
-    let createdAt: Date
-    let drawingData: Data
-}
+// データ保存用の構造体は不要になる
+// struct NoteBookData: Codable { ... }
+// struct NoteData: Codable { ... }
 
 // カスタムボタンスタイル（タップ効果付き）
 struct ScaleButtonStyle: ButtonStyle {
